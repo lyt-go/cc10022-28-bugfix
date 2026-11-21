@@ -8,6 +8,26 @@ from app.services.base import BaseModuleService
 from app.store import store
 
 
+def parse_confidence(value: Any) -> float | None:
+    """解析置信度字段：合法数字返回 float，「待核」等非数字值返回 None。
+
+    存量历史记录的置信度可能被写成待核文本，直接 float() 会让整批查询报错；
+    统一经由本函数读取，非数字值显式表达为「无法评估」，而不是当作 0 分或
+    放任异常向上抛出，避免未知客户被误判为满足置信度门槛。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
 class GoldenRecordService(BaseModuleService):
     MODULE = "golden_record"
     ENTITY = "黄金记录"
@@ -116,18 +136,84 @@ class GoldenRecordService(BaseModuleService):
 
         查询golden_records存储，按实体模型筛选并过滤置信度
         低于阈值的记录，返回符合条件的黄金记录列表。
+
+        置信度为「待核」等非数字值的存量记录无法评估，不能按 0 分参与
+        阈值判定，因此只返回有效置信度记录，异常记录由
+        search_golden_records_with_anomalies 单独披露，保证整批查询不再报错。
+        """
+        eligible, _anomalies = self.search_golden_records_with_anomalies(
+            entity_model=entity_model, min_confidence=min_confidence)
+        return eligible
+
+    def search_golden_records_with_anomalies(
+        self,
+        entity_model: str | None = None,
+        min_confidence: float = 0.0,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """搜索黄金记录并分离异常记录：渠道名单与黄金检索共用同一份读取逻辑。
+
+        数字阈值与排序规则保持不变，只对可解析为数字的有效置信度生效；
+        非数字置信度（如待核）被标记为无法评估，既不满足任何门槛、也不
+        参与排序，作为异常记录单独返回，支撑正常记录对账与异常后的重试。
+
+        返回 (eligible, anomalies)：
+        - eligible：有效置信度且达到 min_confidence 的记录，按置信度降序；
+        - anomalies：非数字/缺失置信度的记录，附 confidence_status=无法评估、
+          confidence_raw 原值和异常原因。
         """
         rows = store.rows(self.MODULE)
-        results = [
-            row for row in rows
-            if row.get("status") == "已生效"
-        ]
+        effective_rows = [row for row in rows if row.get("status") == "已生效"]
         if entity_model:
-            results = [r for r in results if r.get("实体模型") == entity_model]
-        results = [r for r in results if float(r.get("置信度", "0")) >= min_confidence]
-        # 查询黄金记录：筛选已生效、匹配实体模型且置信度达标的记录
-        results.sort(key=lambda r: float(r.get("置信度", "0")), reverse=True)
-        return results
+            effective_rows = [r for r in effective_rows if r.get("实体模型") == entity_model]
+
+        eligible: list[dict[str, Any]] = []
+        anomalies: list[dict[str, Any]] = []
+        for row in effective_rows:
+            score = parse_confidence(row.get("置信度"))
+            if score is None:
+                flagged = dict(row)
+                flagged["confidence_status"] = "无法评估"
+                flagged["confidence_raw"] = row.get("置信度")
+                flagged["anomaly_reason"] = "置信度字段不是可解析数字，无法评估是否满足门槛"
+                anomalies.append(flagged)
+                continue
+            # 仍按原有数字阈值判定，未知分数不会被当作满足门槛
+            if score >= min_confidence:
+                eligible.append(row)
+        # 仍按原有规则对有效置信度降序排序
+        eligible.sort(key=lambda r: parse_confidence(r.get("置信度")) or 0.0, reverse=True)
+        return eligible, anomalies
+
+    def repair_golden_confidence(self, golden_id: str, confidence: Any) -> dict[str, Any]:
+        """修正黄金记录的异常置信度：把待核等非数字值改为合法数字分数。
+
+        供异常修复后重新对账使用：新值必须可解析为数字，否则拒绝写入，
+        避免再次产生无法评估的存量记录。
+        """
+        record = self.query_golden_record(golden_id)
+        if not record:
+            return {"ok": False, "reason": "黄金记录不存在"}
+        score = parse_confidence(confidence)
+        if score is None:
+            return {
+                "ok": False,
+                "reason": f"新置信度 {confidence!r} 不是合法数字，无法完成修正",
+            }
+        # query_golden_record 返回的是快照副本，必须回写到存储中的原始行
+        target = next(
+            (row for row in store.rows(self.MODULE) if row.get("黄金ID") == golden_id),
+            None,
+        )
+        if target is None:
+            return {"ok": False, "reason": "黄金记录不存在"}
+        target["置信度"] = f"{score:.2f}"
+        target["abnormal"] = False
+        return {
+            "ok": True,
+            "golden_id": golden_id,
+            "置信度": target["置信度"],
+            "confidence_status": "有效",
+        }
 
     def export_golden_records(self, entity_model: str) -> list[dict[str, Any]]:
         """导出黄金记录：将指定实体模型的黄金记录导出供下游系统消费。
@@ -142,7 +228,7 @@ class GoldenRecordService(BaseModuleService):
             exported.append({
                 "golden_id": r.get("黄金ID"),
                 "entity_model": r.get("实体模型"),
-                "confidence": float(r.get("置信度", "0")),
+                "confidence": parse_confidence(r.get("置信度")) or 0.0,
                 "sources": (r.get("关联来源", "")).split("|"),
                 "key_fields": (r.get("关键字段", "")).split(","),
             })
